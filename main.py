@@ -8,11 +8,19 @@ from datetime import timedelta
 import re
 import os
 from urllib.request import urlretrieve
+import giphy_client
+from giphy_client.rest import ApiException
+import pdfplumber
+import PyPDF2
+from docx import Document
+import tempfile
+from openpyxl import load_workbook
+import pandas as pd
 
-SLACK_APP_TOKEN = 'xapp-xxxxx'
-SLACK_BOT_TOKEN = 'xoxb-yyyyy'
+SLACK_APP_TOKEN = 'xapp-1-xxxx'
+SLACK_BOT_TOKEN = 'xoxb-yyyyyy'
 
-openai.api_key = "sk-zzzzz"
+openai.api_key = "sk-zzzzzzzzz"
 
 # Configurar un registro personalizado
 logging.basicConfig(level=logging.CRITICAL)
@@ -22,6 +30,135 @@ logger.setLevel(logging.CRITICAL)
 app = App(token=SLACK_BOT_TOKEN)
 
 bot_user_id = None
+
+GIPHY_API_KEY = "XbkzGLFUruSsh2FUrMBVt4gUeHBIOgCF"
+giphy_api_instance = giphy_client.DefaultApi()
+
+def search_gif(keyword):
+    try:
+        # Realiza una búsqueda en Giphy usando la palabra clave
+        response = giphy_api_instance.gifs_search_get(GIPHY_API_KEY, keyword, limit=1, rating='g')
+
+        if response.data:
+            # Retorna la URL del primer GIF encontrado
+            return response.data[0].images.fixed_height.url
+        else:
+            return None
+    except ApiException as e:
+        print(f"Error al buscar el GIF: {e}")
+        return None
+
+def read_txt_file(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+
+    text = response.text
+    return text[:2000]
+
+def read_excel_file(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+
+    with tempfile.NamedTemporaryFile() as tmp_file:
+        tmp_file.write(response.content)
+        tmp_file.flush()
+
+        df = pd.read_excel(tmp_file.name, engine='openpyxl')
+
+    # Convert the DataFrame to a string
+    text = df.to_string(index=False)
+
+    return text[:2000]
+
+def read_pdf_file(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers, stream=True)
+    response.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(response.content)
+        tmp_file.flush()
+        tmp_file_path = tmp_file.name
+
+    text = ""
+    with pdfplumber.open(tmp_file_path) as pdf:
+        for page_num in range(min(len(pdf.pages), 3)):
+            page = pdf.pages[page_num]
+            extracted_text = page.extract_text()
+            if not extracted_text:
+                with open(tmp_file_path, "rb") as f:
+                    pdf_reader = PyPDF2.PdfFileReader(f)
+                    extracted_text = pdf_reader.getPage(page_num).extract_text()
+            text += extracted_text
+
+    return text[:2000]
+
+def read_docx_file(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers, stream=True)
+    response.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(response.content)
+        tmp_file.flush()
+        tmp_file_path = tmp_file.name
+
+    with open(tmp_file_path, "rb") as f:
+        doc = Document(f)
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+
+    return text[:2000]
+
+def read_csv_file(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+
+    text = response.text
+    return text[:2000]
+
+def read_file(file, token):
+    url = file['url_private']
+    file_type = file['filetype']
+
+    if file_type == "txt":
+        content = read_txt_file(url, token)
+    elif file_type == "pdf":
+        content = read_pdf_file(url, token)
+    elif file_type == "docx" or file_type == "doc":
+        content = read_docx_file(url, token)
+    elif file_type == "csv":
+        content = read_csv_file(url, token)
+    elif file_type == "xls" or file_type == "xlsx":
+        content = read_excel_file(url, token)
+    else:
+        content = read_txt_file(url, token)
+
+    return content
+
+def generate_summary(text, file_type):
+
+    # Configura el historial de mensajes con el asistente especializado en resumir y hacer esquemas
+    message_history = [
+        {"role": "system", "content": "Eres un asistente especialista en resumir y hacer esquemas del contenido de textos siempre atendiendo a lo interesante de acuerdo al tipo de contenido detectado: txt, csv, word, pdf, php, etc. Como máximo el resumen debe tener 1000 palabras. Si es codigo fuente haz snippetm si es csv memoriza la estructura, etc."},
+        {"role": "user", "content": f"Por favor, resume este texto de tipo {file_type}: {text}"}
+    ]
+
+    # Llama a la API de ChatGPT de OpenAI
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=message_history
+    )
+
+    # Obtiene el resumen del texto
+    summary = response.choices[0].message.content
+
+    # Limita el resumen a 1000 palabras
+    summary = ' '.join(summary.split()[:1000])
+
+    return summary
 
 def remove_weird_chars(text):
     return re.sub(r"[^a-zA-Z0-9\s.,ñ:áéíóú?+<@>!¡¿()&€@#_\-/*\"':;%=\\`~%\[\]{}^$@;:'\"+#.,°<>]", "", text)
@@ -70,7 +207,8 @@ def image_request_system_message():
             "Luego, devuelve una respuesta en el formato 'call=generate_image, args:n=1,size=256x256, prompt:xxxx', "
             "donde 'xxxx' es el prompt mejorado y traducido al inglés. Si se solicita una edición de una imagen, "
             "devuelve 'call=edit_image, args:n=1,size=256x256, prompt:xxxx'. Si se solicita una variación de una imagen, "
-            "devuelve 'call=create_variation, args:n=1,size=256x256'. En cualquier otro caso devuelve 'call=None'. "
+            "devuelve 'call=create_variation, args:n=1,size=256x256'. Si se solicita un GIF animado, devuelve una respuesta en el formato 'call=generate_gif, args:prompt:xxxx', "
+            "donde 'xxxx' es el keyword para buscar intenta resumir lo que se necesita sin mencionar la palabra gif se conciso. En cualquier otro caso devuelve 'call=None'. "
             "Devuelve exclusivamente con el formato tal cual sin ningun otro texto anterior o posterior al mismo."
         )
     }
@@ -113,7 +251,7 @@ def command_handler(body, say):
         image_url = images[0]['url_private_download']
     if len(images) >= 2:
         mask_url = images[1]['url_private_download']
-    print(image_url)
+
     if user_id == bot_user_id:
         return  # Ignorar mensajes del propio bot
 
@@ -130,6 +268,31 @@ def command_handler(body, say):
 
         # Reemplazar el ID de usuario en el texto con su nombres de usuario
         username = get_username_from_id(app.client, user_id)
+
+        has_summary = False
+        if files:
+            # Lee solo el primer archivo
+            file = files[0]
+            file_type = file["filetype"]
+
+            if file_type not in ["jpg", "jpeg", "png", "gif"]:
+                content = read_file(file, SLACK_BOT_TOKEN)
+                if content:
+                    # Llama a la API de ChatGPT para generar el resumen
+                    resumen = generate_summary(content, file_type)
+                    if resumen:
+                        # Agrega el mensaje con el resumen al historial del canal
+                        message_file = f"{username} ({current_timestamp}): {username} adjunta este fichero cuyo resumen o esquema es el siguiente: {resumen}"
+
+                        # Verificar si el nuevo mensaje excede el límite de tokens
+                        while get_total_tokens(message_histories[channel_id]) + len(message_file) > 2000:
+                             if len(message_histories[channel_id]) > 1:
+                                 message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
+                             else:
+                                 break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
+
+                        message_histories[channel_id].append({"role": "user", "content": message_file})
+                        has_summary = True
 
         text = f"{username} ({current_timestamp}): {text}"
 
@@ -161,7 +324,23 @@ def command_handler(body, say):
 
               # Procesa la respuesta del modelo para determinar si se solicita la generación de una imagen y extraer los parámetros
               call_match = re.search(r"call=(\w+)", image_request_answer)
-              if call_match and call_match.group(1) == "generate_image":
+              if call_match and call_match.group(1) == "generate_gif" and not has_summary:
+                  match_prompt = re.search(r"prompt:(.*)", image_request_answer)
+                  if match_prompt:
+                      translated_prompt = match_prompt.group(1)
+                  else:
+                      translated_prompt = text
+
+                  gif_url = search_gif(translated_prompt)
+
+                  if gif_url:
+                      say(f"Aquí tienes un GIF sobre {translated_prompt}: {gif_url}")
+                  else:
+                      say(f"No pude encontrar un GIF sobre {translated_prompt}.")
+
+                  message_histories[channel_id].pop()
+
+              elif call_match and call_match.group(1) == "generate_image" and not has_summary:
                   n = 1
                   size = "1024x1024"
                   match_n = re.search(r"n=(\d+)", image_request_answer)
@@ -194,7 +373,10 @@ def command_handler(body, say):
                       text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
                       blocks=image_blocks
                   )
-              elif call_match and call_match.group(1) == "edit_image" and image_url and mask_url:
+
+                  message_histories[channel_id].pop()
+
+              elif call_match and call_match.group(1) == "edit_image" and image_url and mask_url and not has_summary:
                 n = 1
                 size = "1024x1024"
                 match_n = re.search(r"n=(\d+)", image_request_answer)
@@ -233,7 +415,10 @@ def command_handler(body, say):
                     text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
                     blocks=image_blocks
                 )
-              elif call_match and call_match.group(1) == "create_variation" and image_url:
+
+                message_histories[channel_id].pop()
+
+              elif call_match and call_match.group(1) == "create_variation" and image_url and not has_summary:
                 n = 1
                 size = "1024x1024"
                 match_n = re.search(r"n=(\d+)", image_request_answer)
@@ -264,6 +449,9 @@ def command_handler(body, say):
                     text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
                     blocks=image_blocks
                 )
+
+                message_histories[channel_id].pop()
+
               else:
                   try:
                     response = openai.ChatCompletion.create(
