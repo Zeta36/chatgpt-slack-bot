@@ -16,6 +16,8 @@ from docx import Document
 import tempfile
 from openpyxl import load_workbook
 import pandas as pd
+import gtts
+import warnings
 
 SLACK_APP_TOKEN = 'xapp-1-xxxx'
 SLACK_BOT_TOKEN = 'xoxb-yyyyyy'
@@ -26,6 +28,7 @@ openai.api_key = "sk-zzzzzzzzz"
 logging.basicConfig(level=logging.CRITICAL)
 logger = logging.getLogger("slack_bolt")
 logger.setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=UserWarning, module="slack_sdk")
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -54,7 +57,7 @@ def read_txt_file(url, token):
     response.raise_for_status()
 
     text = response.text
-    return text[:2000]
+    return text[:6000]
 
 def read_excel_file(url, token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -70,7 +73,7 @@ def read_excel_file(url, token):
     # Convert the DataFrame to a string
     text = df.to_string(index=False)
 
-    return text[:2000]
+    return text[:6000]
 
 def read_pdf_file(url, token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -93,7 +96,7 @@ def read_pdf_file(url, token):
                     extracted_text = pdf_reader.getPage(page_num).extract_text()
             text += extracted_text
 
-    return text[:2000]
+    return text[:6000]
 
 def read_docx_file(url, token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -109,7 +112,7 @@ def read_docx_file(url, token):
         doc = Document(f)
         text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
 
-    return text[:2000]
+    return text[:6000]
 
 def read_csv_file(url, token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -117,7 +120,7 @@ def read_csv_file(url, token):
     response.raise_for_status()
 
     text = response.text
-    return text[:2000]
+    return text[:6000]
 
 def read_file(file, token):
     url = file['url_private']
@@ -142,21 +145,21 @@ def generate_summary(text, file_type):
 
     # Configura el historial de mensajes con el asistente especializado en resumir y hacer esquemas
     message_history = [
-        {"role": "system", "content": "Eres un asistente especialista en resumir y hacer esquemas del contenido de textos siempre atendiendo a lo interesante de acuerdo al tipo de contenido detectado: txt, csv, word, pdf, php, etc. Como máximo el resumen debe tener 1000 palabras. Si es codigo fuente haz snippetm si es csv memoriza la estructura, etc."},
+        {"role": "system", "content": "Eres un asistente especialista en resumir y hacer esquemas del contenido de textos siempre atendiendo a lo interesante de acuerdo al tipo de contenido detectado: txt, csv, word, pdf, php, etc. Como máximo el resumen debe tener 1000 palabras. Si es codigo fuente quedate con lo importante, si es csv o excel memoriza la estructura, etc. Intenta que el texto tenga un contenido de sobre 2000 palabras y abarca toda la informacion que puedas sacar del mismo para el uso de este resumen en el futuro."},
         {"role": "user", "content": f"Por favor, resume este texto de tipo {file_type}: {text}"}
     ]
 
     # Llama a la API de ChatGPT de OpenAI
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4",
         messages=message_history
     )
 
     # Obtiene el resumen del texto
     summary = response.choices[0].message.content
 
-    # Limita el resumen a 1000 palabras
-    summary = ' '.join(summary.split()[:1000])
+    # Limita el resumen a 2000 palabras
+    summary = ' '.join(summary.split()[:2000])
 
     return summary
 
@@ -281,11 +284,14 @@ def command_handler(body, say):
                     # Llama a la API de ChatGPT para generar el resumen
                     resumen = generate_summary(content, file_type)
                     if resumen:
+                        # Reemplazar el ID de usuario en el texto con su nombres de usuario
+                        botusername = get_username_from_id(app.client, bot_user_id)
+
                         # Agrega el mensaje con el resumen al historial del canal
-                        message_file = f"{username} ({current_timestamp}): {username} adjunta este fichero cuyo resumen o esquema es el siguiente: {resumen}"
+                        message_file = f"{botusername} ({current_timestamp}): el usuario {username} ha adjuntado un fichero de tipo {file_type} cuyo resumen o esquema es: {resumen}"
 
                         # Verificar si el nuevo mensaje excede el límite de tokens
-                        while get_total_tokens(message_histories[channel_id]) + len(message_file) > 2000:
+                        while get_total_tokens(message_histories[channel_id]) + len(message_file) > 6000:
                              if len(message_histories[channel_id]) > 1:
                                  message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
                              else:
@@ -299,7 +305,7 @@ def command_handler(body, say):
         text = remove_weird_chars(text)
 
         # Verificar si el nuevo mensaje excede el límite de tokens
-        while get_total_tokens(message_histories[channel_id]) + len(text.split()) > 2000:
+        while get_total_tokens(message_histories[channel_id]) + len(text.split()) > 6000:
             if len(message_histories[channel_id]) > 1:
                 message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
             else:
@@ -316,7 +322,7 @@ def command_handler(body, say):
 
           try:
               response = openai.ChatCompletion.create(
-                  model="gpt-3.5-turbo",
+                  model="gpt-4",
                   messages=image_request_history
               )
 
@@ -455,7 +461,7 @@ def command_handler(body, say):
               else:
                   try:
                     response = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
+                        model="gpt-4",
                         messages=message_histories[channel_id]
                     )
 
@@ -471,6 +477,15 @@ def command_handler(body, say):
 
                     say(answer)
 
+                    try:
+                        if len(answer) > 600:
+                            tts = gtts.gTTS(answer, lang="es")
+                            mp3_file = "response.mp3"
+                            tts.save(mp3_file)
+                            response = app.client.files_upload_v2(channels=channel_id,file=mp3_file,title="Respuesta en audio")
+                    except Exception as e:
+                        say(f"Error al enviar el archivo MP3: {e}")
+
                     # Reemplazar el ID de usuario en el texto con su nombres de usuario
                     botusername = get_username_from_id(app.client, bot_user_id)
 
@@ -480,12 +495,13 @@ def command_handler(body, say):
                   except Exception as e:
                     print(e)
                     say("Lo siento, no puedo responder en este momento.")
-                    if len(message_histories[channel_id]) > 1:
-                        message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
-                    message_histories[channel_id].pop()  # Eliminar el último mensaje añadido
+
+                  if len(message_histories[channel_id]) > 1:
+                      message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
+                  message_histories[channel_id].pop()  # Eliminar el último mensaje añadido
 
                   # Verificar si la respuesta del asistente excede el límite de tokens
-                  while get_total_tokens(message_histories[channel_id]) + len(answer.split()) > 2000:
+                  while get_total_tokens(message_histories[channel_id]) + len(answer.split()) > 6000:
                       if len(message_histories[channel_id]) > 1:
                           message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
                       else:
