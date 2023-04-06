@@ -297,7 +297,7 @@ def command_handler(body, say):
                              else:
                                  break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
 
-                        message_histories[channel_id].append({"role": "user", "content": message_file})
+                        message_histories[channel_id].append({"role": "assistant", "content": message_file})
                         has_summary = True
 
         text = f"{username} ({current_timestamp}): {text}"
@@ -322,7 +322,7 @@ def command_handler(body, say):
 
           try:
               response = openai.ChatCompletion.create(
-                  model="gpt-4",
+                  model="gpt-3.5-turbo",
                   messages=image_request_history
               )
 
@@ -478,7 +478,7 @@ def command_handler(body, say):
                     say(answer)
 
                     try:
-                        if len(answer) > 600:
+                        if len(answer) > 600 and len(answer) < 2000:
                             tts = gtts.gTTS(answer, lang="es")
                             mp3_file = "response.mp3"
                             tts.save(mp3_file)
@@ -496,9 +496,9 @@ def command_handler(body, say):
                     print(e)
                     say("Lo siento, no puedo responder en este momento.")
 
-                  if len(message_histories[channel_id]) > 1:
-                      message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
-                  message_histories[channel_id].pop()  # Eliminar el último mensaje añadido
+                    if len(message_histories[channel_id]) > 1:
+                        message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
+                    message_histories[channel_id].pop()  # Eliminar el último mensaje añadido
 
                   # Verificar si la respuesta del asistente excede el límite de tokens
                   while get_total_tokens(message_histories[channel_id]) + len(answer.split()) > 6000:
@@ -506,7 +506,6 @@ def command_handler(body, say):
                           message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
                       else:
                           break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
-
 
                   message_histories[channel_id].append({"role": "assistant", "content": answer})
           except Exception as e:
