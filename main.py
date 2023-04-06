@@ -302,7 +302,7 @@ def command_handler(body, say):
 
         text = f"{username} ({current_timestamp}): {text}"
 
-        text = remove_weird_chars(text)
+        text = remove_weird_chars(text).replace("(audio)", "")
 
         # Verificar si el nuevo mensaje excede el límite de tokens
         while get_total_tokens(message_histories[channel_id]) + len(text.split()) > 6000:
@@ -478,7 +478,7 @@ def command_handler(body, say):
                     say(answer)
 
                     try:
-                        if len(answer) > 600 and len(answer) < 2000:
+                        if "(audio)" in body['event']['text']:
                             tts = gtts.gTTS(answer, lang="es")
                             mp3_file = "response.mp3"
                             tts.save(mp3_file)
