@@ -204,14 +204,14 @@ def image_request_system_message():
     return {
         "role": "system",
         "content": (
-            "Eres un asistente que tiene la tarea de detectar si se solicita una imagen en un mensaje de texto. "
+            "Eres un asistente que tiene la tarea de detectar si se solicita una imagen en un mensaje de texto. Es importante que detectes si aparece en el mensaje la paltaba imagen o un sinonimo si no es asi probablemente debas devolver el comando call:None."
             "Si se solicita una imagen, primero debes mejorar y traducir el prompt al inglés eliminando "
             "cualquier referencia a 'size' o 'n' y asegurándote de que no haya preguntas ni peticiones al usuario. "
             "Luego, devuelve una respuesta en el formato 'call=generate_image, args:n=1,size=256x256, prompt:xxxx', "
             "donde 'xxxx' es el prompt mejorado y traducido al inglés. Si se solicita una edición de una imagen, "
             "devuelve 'call=edit_image, args:n=1,size=256x256, prompt:xxxx'. Si se solicita una variación de una imagen, "
             "devuelve 'call=create_variation, args:n=1,size=256x256'. Si se solicita un GIF animado, devuelve una respuesta en el formato 'call=generate_gif, args:prompt:xxxx', "
-            "donde 'xxxx' es el keyword para buscar intenta resumir lo que se necesita sin mencionar la palabra gif se conciso. En cualquier otro caso devuelve 'call=None'. "
+            "donde 'xxxx' es el keyword para buscar intenta resumir lo que se necesita sin mencionar la palabra gif se conciso. En cualquier otro caso principalmente cuando no se menciona la palabra imagen o gif o sinonimos devuelve 'call=None'. "
             "Devuelve exclusivamente con el formato tal cual sin ningun otro texto anterior o posterior al mismo."
         )
     }
