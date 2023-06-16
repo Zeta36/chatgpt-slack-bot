@@ -6,23 +6,59 @@ import logging
 import datetime
 from datetime import timedelta
 import re
-import os
-from urllib.request import urlretrieve
 import giphy_client
 from giphy_client.rest import ApiException
-import pdfplumber
-import PyPDF2
-from docx import Document
-import tempfile
-from openpyxl import load_workbook
-import pandas as pd
 import gtts
 import warnings
+import redis
+import json
+from utils import *
+from bs4 import BeautifulSoup
+import ast
+import operator as op
 
-SLACK_APP_TOKEN = 'xapp-1-xxxx'
-SLACK_BOT_TOKEN = 'xoxb-yyyyyy'
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+REDIS_DB = 0
 
-openai.api_key = "sk-zzzzzzzzz"
+
+# Define las operaciones matemáticas permitidas
+allowed_operators = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
+                     ast.Div: op.truediv, ast.USub: op.neg}
+
+def evaluate_expr(node):
+    if isinstance(node, ast.Num):  # <number>
+        return node.n
+    elif isinstance(node, ast.BinOp):  # <left> <operator> <right>
+        return allowed_operators[type(node.op)](evaluate_expr(node.left), evaluate_expr(node.right))
+    elif isinstance(node, ast.UnaryOp):  # <operator> <operand> e.g., -1
+        return allowed_operators[type(node.op)](evaluate_expr(node.operand))
+    else:
+        raise TypeError(node)
+
+def calculate(expression):
+    """Evaluate a math expression."""
+    return evaluate_expr(ast.parse(expression, mode='eval').body)
+
+class ImageGenerationComplete(Exception):
+    pass
+
+def save_all_message_histories_to_redis(message_histories):
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    message_histories_str = {channel_id: json.dumps(history) for channel_id, history in message_histories.items()}
+    r.hmset("message_histories", message_histories_str)
+
+def load_all_message_histories_from_redis():
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    loaded_message_histories = r.hgetall("message_histories")
+    if loaded_message_histories:
+        return {channel_id.decode('utf-8'): json.loads(history) for channel_id, history in loaded_message_histories.items()}
+    return {}
+
+SLACK_APP_TOKEN = 'xapp-xxxxxxx'
+SLACK_BOT_TOKEN = 'xoxb-yyyyyyy'
+
+openai.api_key = "xxxxxxx"
 
 # Configurar un registro personalizado
 logging.basicConfig(level=logging.CRITICAL)
@@ -34,8 +70,78 @@ app = App(token=SLACK_BOT_TOKEN)
 
 bot_user_id = None
 
-GIPHY_API_KEY = "XbkzGLFUruSsh2FUrMBVt4gUeHBIOgCF"
+GIPHY_API_KEY = "zzzzz"
 giphy_api_instance = giphy_client.DefaultApi()
+
+GOOGLE_API_KEY = "yyyyy"
+GOOGLE_CSE_ID = "xxxx"
+
+def search_web(query):
+    """Search the web for a given query using Google Search API"""
+
+    # Define la URL de la API y los parámetros de la búsqueda
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        'q': query,
+        'key': GOOGLE_API_KEY,
+        'cx': GOOGLE_CSE_ID,
+    }
+
+    # Realiza la solicitud a la API
+    response = requests.get(url, params=params)
+
+    # Comprueba que la solicitud fue exitosa
+    if response.status_code == 200:
+        search_results = response.json()
+        # Procesa los resultados de la búsqueda
+        processed_results = []
+        for result in search_results["items"][:2]:  # Limita a los primeros 3 resultados
+            # Visita cada página de los resultados y extrae el texto
+            page_response = requests.get(result["link"])
+            if page_response.status_code == 200:
+                soup = BeautifulSoup(page_response.content, "html.parser")
+                # Elimina todos los scripts y estilos
+                for script in soup(["script", "style"]):
+                    script.extract()
+                text = soup.get_text()
+                # Rompe en líneas y elimina espacios en blanco al principio y al final
+                lines = (line.strip() for line in text.splitlines())
+                # Rompe líneas múltiples en una línea
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                # Elimina espacios en blanco
+                text = '\n'.join(chunk for chunk in chunks if chunk)
+                processed_results.append({
+                    "title": result["title"],
+                    "link": result["link"],
+                    "content": text,
+                })
+        return json.dumps({"results": processed_results})
+    else:
+        return json.dumps({"error": "La búsqueda en la web falló"})
+
+def get_url(url):
+    """Fetch and summarize the content of a given URL"""
+
+    # Fetch the content of the URL
+    response = requests.get(url)
+
+    # Check that the request was successful
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.content, "html.parser")
+        # Remove all scripts and styles
+        for script in soup(["script", "style"]):
+            script.extract()
+        text = soup.get_text()
+        # Break into lines and remove leading and trailing space
+        lines = (line.strip() for line in text.splitlines())
+        # Break multi-headlines into a line
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        # Drop blank lines
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+
+        return text
+    else:
+        return json.dumps({"error": "Fetching the URL content failed"})
 
 def search_gif(keyword):
     try:
@@ -51,126 +157,47 @@ def search_gif(keyword):
         print(f"Error al buscar el GIF: {e}")
         return None
 
-def read_txt_file(url, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-
-    text = response.text
-    return text[:6000]
-
-def read_excel_file(url, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-
-    with tempfile.NamedTemporaryFile() as tmp_file:
-        tmp_file.write(response.content)
-        tmp_file.flush()
-
-        df = pd.read_excel(tmp_file.name, engine='openpyxl')
-
-    # Convert the DataFrame to a string
-    text = df.to_string(index=False)
-
-    return text[:6000]
-
-def read_pdf_file(url, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, stream=True)
-    response.raise_for_status()
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(response.content)
-        tmp_file.flush()
-        tmp_file_path = tmp_file.name
-
-    text = ""
-    with pdfplumber.open(tmp_file_path) as pdf:
-        for page_num in range(min(len(pdf.pages), 3)):
-            page = pdf.pages[page_num]
-            extracted_text = page.extract_text()
-            if not extracted_text:
-                with open(tmp_file_path, "rb") as f:
-                    pdf_reader = PyPDF2.PdfFileReader(f)
-                    extracted_text = pdf_reader.getPage(page_num).extract_text()
-            text += extracted_text
-
-    return text[:6000]
-
-def read_docx_file(url, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, stream=True)
-    response.raise_for_status()
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(response.content)
-        tmp_file.flush()
-        tmp_file_path = tmp_file.name
-
-    with open(tmp_file_path, "rb") as f:
-        doc = Document(f)
-        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-
-    return text[:6000]
-
-def read_csv_file(url, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-
-    text = response.text
-    return text[:6000]
-
-def read_file(file, token):
-    url = file['url_private']
-    file_type = file['filetype']
-
-    if file_type == "txt":
-        content = read_txt_file(url, token)
-    elif file_type == "pdf":
-        content = read_pdf_file(url, token)
-    elif file_type == "docx" or file_type == "doc":
-        content = read_docx_file(url, token)
-    elif file_type == "csv":
-        content = read_csv_file(url, token)
-    elif file_type == "xls" or file_type == "xlsx":
-        content = read_excel_file(url, token)
-    else:
-        content = read_txt_file(url, token)
-
-    return content
-
 def generate_summary(text, file_type):
 
     # Configura el historial de mensajes con el asistente especializado en resumir y hacer esquemas
     message_history = [
-        {"role": "system", "content": "Eres un asistente especialista en resumir y hacer esquemas del contenido de textos siempre atendiendo a lo interesante de acuerdo al tipo de contenido detectado: txt, csv, word, pdf, php, etc. Como máximo el resumen debe tener 1000 palabras. Si es codigo fuente quedate con lo importante, si es csv o excel memoriza la estructura, etc. Intenta que el texto tenga un contenido de sobre 2000 palabras y abarca toda la informacion que puedas sacar del mismo para el uso de este resumen en el futuro."},
+        {"role": "system", "content": "Eres un asistente especialista en resumir y hacer esquemas del contenido de textos siempre atendiendo a lo interesante de acuerdo al tipo de contenido detectado: txt, csv, word, pdf, php, etc. Como máximo el resumen debe tener 10000 caracteres. Si es codigo fuente quedate con lo importante, si es csv o excel memoriza la estructura, etc. Intenta que el texto tenga como máximo 10000 caracteres y abarca toda la informacion que puedas sacar del mismo para el uso de este resumen en el futuro."},
         {"role": "user", "content": f"Por favor, resume este texto de tipo {file_type}: {text}"}
     ]
 
     # Llama a la API de ChatGPT de OpenAI
     response = openai.ChatCompletion.create(
-        model="gpt-4",
+        model="gpt-3.5-turbo-16k",
         messages=message_history
     )
 
     # Obtiene el resumen del texto
     summary = response.choices[0].message.content
 
-    # Limita el resumen a 2000 palabras
-    summary = ' '.join(summary.split()[:2000])
+    # Limita el resumen a 10000 caracteres
+    summary = ' '.join(summary.split()[:10000])
 
     return summary
 
-def remove_weird_chars(text):
-    return re.sub(r"[^a-zA-Z0-9\s.,ñ:áéíóú?+<@>!¡¿()&€@#_\-/*\"':;%=\\`~%\[\]{}^$@;:'\"+#.,°<>]", "", text)
+def generate_image(channel_id, n=1, size = "1024x1024", prompt=""):
+    # Llama a la API para generar la imagen
+    image_response = openai.Image.create(
+        prompt=prompt,
+        n=n,
+        size=size
+    )
 
-def get_total_tokens(messages):
-    total_tokens = 0
-    for message in messages:
-        total_tokens += len(message["content"].split())
-    return total_tokens
+    image_urls = [data["url"] for data in image_response["data"]]
+
+    # Construye bloques de imágenes para enviar al canal de Slack
+    image_blocks = build_image_blocks(image_urls)
+
+    # Envía las imágenes generadas al canal de slack
+    app.client.chat_postMessage(
+        channel=channel_id,
+        text=f"Aquí tienes {n} imagen(es) generada(s)",
+        blocks=image_blocks
+    )
 
 # Iniciar la aplicación
 def start():
@@ -181,60 +208,6 @@ def start():
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()
 
-
-def get_username_from_id(slack_client, user_id):
-    response = slack_client.users_info(user=user_id)
-    if response['ok']:
-        user_profile = response['user']
-        return user_profile.get('real_name', 'name')
-    else:
-        return None
-
-
-def replace_user_ids_with_usernames(slack_client, text):
-    user_ids = re.findall(r'<@([A-Z0-9]+)>', text)
-
-    for user_id in user_ids:
-        username = get_username_from_id(slack_client, user_id)
-        if username:
-            text = text.replace(f'<@{user_id}>', f'*{username}*')
-    return text
-
-def image_request_system_message():
-    return {
-        "role": "system",
-        "content": (
-            "Eres un asistente que tiene la tarea de detectar si se solicita una imagen en un mensaje de texto. Es importante que detectes si aparece en el mensaje la palaabra crea, genera o sinonimos."
-            "Si se solicita una imagen, primero debes mejorar y traducir el prompt al inglés eliminando "
-            "cualquier referencia a 'size' o 'n' y asegurándote de que no haya preguntas ni peticiones al usuario. "
-            "Luego, devuelve una respuesta en el formato 'call=generate_image, args:n=1,size=256x256, prompt:xxxx', "
-            "donde 'xxxx' es el prompt mejorado y traducido al inglés. Si se solicita una edición de una imagen, "
-            "devuelve 'call=edit_image, args:n=1,size=256x256, prompt:xxxx'. Si se solicita una variación de una imagen, "
-            "devuelve 'call=create_variation, args:n=1,size=256x256'. Si se solicita un GIF animado, devuelve una respuesta en el formato 'call=generate_gif, args:prompt:xxxx', "
-            "donde 'xxxx' es el keyword para buscar intenta resumir lo que se necesita sin mencionar la palabra gif se conciso. En cualquier otro caso debes devolver 'call=None'. "
-            "Devuelve exclusivamente con el formato tal cual sin ningun otro texto anterior o posterior al mismo."
-        )
-    }
-
-def download_image(url, local_file_path, token):
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers, stream=True)
-    response.raise_for_status()
-    with open(local_file_path, "wb") as local_file:
-        for chunk in response.iter_content(chunk_size=8192):
-            local_file.write(chunk)
-
-def build_image_blocks(image_urls):
-    blocks = []
-    for url in image_urls:
-        block = {
-            "type": "image",
-            "image_url": url,
-            "alt_text": "Imagen generada"
-        }
-        blocks.append(block)
-    return blocks
-
 # Evento de detección de nuevos mensajes
 @app.event("message")
 def command_handler(body, say):
@@ -244,16 +217,6 @@ def command_handler(body, say):
     channel_type = event.get('channel_type')
     user_id = event.get('user')
     files = event.get('files', [])
-    images = [file for file in files if file.get('mimetype', '').startswith('image/')]
-
-    image_url = None
-    mask_url = None
-
-    # Suponiendo que la primera imagen es la imagen principal y la segunda imagen es la máscara
-    if len(images) >= 1:
-        image_url = images[0]['url_private_download']
-    if len(images) >= 2:
-        mask_url = images[1]['url_private_download']
 
     if user_id == bot_user_id:
         return  # Ignorar mensajes del propio bot
@@ -262,7 +225,7 @@ def command_handler(body, say):
         text = body['event']['text']
 
         if channel_id not in message_histories:
-            message_histories[channel_id] = [{"role": "system", "content": "Eres un asistente trabajando en un canal de Slack. Usa por lo tanto emoticonos y formateo de textos adecuados a Slack. Vas a recordar que ha dicho cada usuario del canal porque su mensaje en tu conexto sera el de <@{user_id}>: su mensaje, por ejemplo <@U04V4HVBEAJ>: hola canal! Sin embargo tu respuesta como asistente no contendra este formato sino que simplemente responderas tu mensaje sin el <@{user_id}> (current_timestamp). La hora actual para ti como asistente será la hora registrada en el (current_timestamp) del último mensaje del historial de mensajes. Utiliza esa información para saber a qué día y hora estamos.Cuando vayas a referirte a un user_id concreto usa el formato <@user_id>"}]
+            message_histories[channel_id] = [{"role": "system", "content": "Eres un asistente trabajando en un canal de Slack. Usa por lo tanto emoticonos y formateo de textos adecuados a Slack. Vas a recordar que ha dicho cada usuario del canal porque su mensaje en tu conexto sera el de <@{user_id}>: su mensaje, por ejemplo <@U04V4HVBEAJ>: hola canal! Sin embargo tu respuesta como asistente no contendra este formato sino que simplemente responderas tu mensaje sin el <@{user_id}> (current_timestamp). La hora actual para ti como asistente será la hora registrada en el (current_timestamp) del último mensaje del historial de mensajes. Utiliza esa información para saber a qué día y hora estamos.Cuando vayas a referirte a un user_id concreto usa el formato <@user_id>."}]
 
         # Agregar el nombre del usuario y la fecha actual al mensaje antes de añadirlo al historial
         now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -272,7 +235,6 @@ def command_handler(body, say):
         # Reemplazar el ID de usuario en el texto con su nombres de usuario
         username = get_username_from_id(app.client, user_id)
 
-        has_summary = False
         if files:
             # Lee solo el primer archivo
             file = files[0]
@@ -291,227 +253,322 @@ def command_handler(body, say):
                         message_file = f"{botusername} ({current_timestamp}): el usuario {username} ha adjuntado un fichero de tipo {file_type} cuyo resumen o esquema es: {resumen}"
 
                         # Verificar si el nuevo mensaje excede el límite de tokens
-                        while get_total_tokens(message_histories[channel_id]) + len(message_file) > 6000:
+                        while get_total_tokens(message_histories[channel_id]) + len(message_file) > 3500:
                              if len(message_histories[channel_id]) > 1:
                                  message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
                              else:
                                  break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
 
                         message_histories[channel_id].append({"role": "assistant", "content": message_file})
-                        has_summary = True
 
         text = f"{username} ({current_timestamp}): {text}"
 
         text = remove_weird_chars(text).replace("(audio)", "")
-
+    
         # Verificar si el nuevo mensaje excede el límite de tokens
-        while get_total_tokens(message_histories[channel_id]) + len(text.split()) > 6000:
+        while get_total_tokens(message_histories[channel_id]) + len(text.split()) > 3500:
             if len(message_histories[channel_id]) > 1:
                 message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
             else:
                break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
-
-
+        
         message_histories[channel_id].append({"role": "user", "content": text})
 
         # Comprobar si el bot ha sido mencionado
         if channel_type == 'im' or (channel_type == 'channel' and f'<@{bot_user_id}>' in body['event']['text']):
+            try:
+                # Define las funciones a las que el modelo tiene acceso
+                functions = [
+                    {
+                        "name": "search_web",
+                        "description": "Busca información en la web para una consulta dada",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "La consulta que quieres buscar en la web",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                    {
+                        "name": "generate_image",
+                        "description": "Crea o genera imagenes a partir de un prompt dado",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "n": {
+                                    "type": "integer",
+                                    "description": "El número de imágenes a generar. Un número entero el 1 por defecto",
+                                },
+                                "size": {
+                                    "type": "string",
+                                    "description": "El tamaño de las imágenes a generar. Opciones: ['256x256', '512x512', '1024x1024']",
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "El prompt para generar las imágenes",
+                                },
+                            },
+                            "required": ["n", "size", "prompt"],
+                        },
+                    },
+                    {
+                        "name": "search_gif",
+                        "description": "Busca un GIF a partir de una palabra clave dada",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "keyword": {
+                                    "type": "string",
+                                    "description": "La palabra clave para buscar el GIF",
+                                },
+                            },
+                            "required": ["keyword"],
+                        },
+                    },
+                    {
+                        "name": "get_url",
+                        "description": "Accede al contenido específico de una página web dada en tiempo real y lo devuelve resuimido según las necesidades del contexto",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": "La URL de la web cuyo contenido quieres obtener",
+                                },
+                            },
+                            "required": ["url"],
+                        },
+                    }, 
+                    {
+                        "name": "calculate",
+                        "description": "Calcula una expresión matemática dada",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "expression": {
+                                    "type": "string",
+                                    "description": "La expresión a calcular (solo valen multiplicaciones, divisiones, restas y sumas)",
+                                },
+                            },
+                            "required": ["expression"],
+                        },
+                    }
+                ]
 
-          # Determina si se solicita la generación de una imagen
-          image_request_history = [image_request_system_message(), {"role": "user", "content": text}]
-
-          try:
-              response = openai.ChatCompletion.create(
-                  model="gpt-3.5-turbo",
-                  messages=image_request_history
-              )
-
-              image_request_answer = response.choices[0].message['content'].strip()
-
-              # Procesa la respuesta del modelo para determinar si se solicita la generación de una imagen y extraer los parámetros
-              call_match = re.search(r"call=(\w+)", image_request_answer)
-              if call_match and call_match.group(1) == "generate_gif" and not has_summary:
-                  match_prompt = re.search(r"prompt:(.*)", image_request_answer)
-                  if match_prompt:
-                      translated_prompt = match_prompt.group(1)
-                  else:
-                      translated_prompt = text
-
-                  gif_url = search_gif(translated_prompt)
-
-                  if gif_url:
-                      say(f"Aquí tienes un GIF sobre {translated_prompt}: {gif_url}")
-                  else:
-                      say(f"No pude encontrar un GIF sobre {translated_prompt}.")
-
-                  message_histories[channel_id].pop()
-
-              elif call_match and call_match.group(1) == "generate_image" and not has_summary:
-                  n = 1
-                  size = "1024x1024"
-                  match_n = re.search(r"n=(\d+)", image_request_answer)
-                  match_size = re.search(r"size=(\d+x\d+)", image_request_answer)
-                  match_prompt = re.search(r"prompt:(.*)", image_request_answer)
-                  if match_prompt:
-                    translated_prompt = match_prompt.group(1)
-                  else:
-                    translated_prompt = text
-                  if match_n:
-                      n = int(match_n.group(1))
-                  if match_size:
-                      size = match_size.group(1)
-
-                  # Llama a la API para generar la imagen
-                  image_response = openai.Image.create(
-                      prompt=translated_prompt,
-                      n=n,
-                      size=size
-                  )
-
-                  image_urls = [data["url"] for data in image_response["data"]]
-
-                  # Construye bloques de imágenes para enviar al canal de Slack
-                  image_blocks = build_image_blocks(image_urls)
-
-                  # Envía las imágenes generadas al canal
-                  app.client.chat_postMessage(
-                      channel=channel_id,
-                      text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
-                      blocks=image_blocks
-                  )
-
-                  message_histories[channel_id].pop()
-
-              elif call_match and call_match.group(1) == "edit_image" and image_url and mask_url and not has_summary:
-                n = 1
-                size = "1024x1024"
-                match_n = re.search(r"n=(\d+)", image_request_answer)
-                match_size = re.search(r"size=(\d+x\d+)", image_request_answer)
-                match_prompt = re.search(r"prompt:(.*)", image_request_answer)
-                if match_prompt:
-                  translated_prompt = match_prompt.group(1)
-                else:
-                  translated_prompt = text
-                if match_n:
-                    n = int(match_n.group(1))
-                if match_size:
-                    size = match_size.group(1)
-
-                # Descargar las imágenes
-                download_image(image_url, 'image.png', SLACK_BOT_TOKEN)
-                download_image(mask_url, 'mask.png', SLACK_BOT_TOKEN)
-
-                # Llamar a la API para editar la imagen
-                image_response = openai.Image.create_edit(
-                    image=open('image.png', "rb"),
-                    mask=open('mask.png', "rb"),
-                    prompt=translated_prompt,
-                    n=n,
-                    size=size
+                # Llama al modelo con las funciones definidas
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo-16k-0613",
+                    messages=message_histories[channel_id],
+                    functions=functions,
+                    function_call="auto",
                 )
 
-                image_urls = [data["url"] for data in image_response["data"]]
+                message = response["choices"][0]["message"]
+                reason = response["choices"][0]["finish_reason"]
 
-                # Construye bloques de imágenes para enviar al canal de Slack
-                image_blocks = build_image_blocks(image_urls)
+                # Comprueba si el modelo quiere llamar a una función
+                while reason == "function_call":                    
+                    function_name = message["function_call"]["name"]
+                    
+                    # Carga la cadena JSON en un diccionario de Python
+                    arguments = json.loads(message["function_call"]["arguments"])
 
-                # Envía las imágenes generadas al canal
-                app.client.chat_postMessage(
-                    channel=channel_id,
-                    text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
-                    blocks=image_blocks
-                )
+                    if function_name == "search_web":
+                        # Ahora puedes acceder al valor de "query"
+                        query = arguments["query"]
 
-                message_histories[channel_id].pop()
+                        # Llama a la función
+                        function_response = search_web(
+                            query=query,
+                        )
 
-              elif call_match and call_match.group(1) == "create_variation" and image_url and not has_summary:
-                n = 1
-                size = "1024x1024"
-                match_n = re.search(r"n=(\d+)", image_request_answer)
-                match_size = re.search(r"size=(\d+x\d+)", image_request_answer)
-                if match_n:
-                    n = int(match_n.group(1))
-                if match_size:
-                    size = match_size.group(1)
+                        # Limita la longitud de la respuesta a un máximo de 15000 caracteres
+                        function_response = function_response[:15000]
 
-                # Descargar las imágenes
-                download_image(image_url, 'image.png', SLACK_BOT_TOKEN)
+                        # Llama al modelo de nuevo enviando la respuesta de la función como un nuevo mensaje
+                        response = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo-16k-0613",
+                            messages=[
+                                *message_histories[channel_id],
+                                message,
+                                {
+                                    "role": "function",
+                                    "name": function_name,
+                                    "content": function_response,
+                                }
+                            ],
+                            functions=functions,
+                            function_call="auto"
+                        )   
 
-                # Llama a la API para generar variaciones de la imagen
-                image_response = openai.Image.create_variation(
-                    image=open('image.png', "rb"),
-                    n=n,
-                    size=size
-                )
+                        # Añade la respuesta de la función al historial de mensajes
+                        message_histories[channel_id].append({
+                            "role": "function",
+                            "name": function_name,
+                            "content": function_response,
+                        })
 
-                image_urls = [data["url"] for data in image_response["data"]]
+                        message = response["choices"][0]["message"]
+                        reason = response["choices"][0]["finish_reason"]
 
-                # Construye bloques de imágenes para enviar al canal de Slack
-                image_blocks = build_image_blocks(image_urls)
+                    elif function_name == "get_url":
+                        # Ahora puedes acceder al valor de "url"
+                        url = arguments["url"]
 
-                # Envía las imágenes generadas al canal
-                app.client.chat_postMessage(
-                    channel=channel_id,
-                    text=f"Aquí tienes {n} imagen(es) generada(s) a partir de la descripción: {text}",
-                    blocks=image_blocks
-                )
+                        # Llama a la función
+                        function_response = get_url(
+                            url=url,
+                        )
 
-                message_histories[channel_id].pop()
+                        # Limita la longitud de la respuesta a un máximo de 15000 caracteres
+                        function_response = function_response[:15000]
+                        
+                        # Llama al modelo de nuevo enviando la respuesta de la función como un nuevo mensaje
+                        response = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo-16k-0613",
+                            messages=[
+                                *message_histories[channel_id],
+                                message,
+                                {
+                                    "role": "function",
+                                    "name": function_name,
+                                    "content": function_response,
+                                }
+                            ],
+                            functions=functions,
+                            function_call="auto"
+                        )
 
-              else:
-                  try:
-                    response = openai.ChatCompletion.create(
-                        model="gpt-4",
-                        messages=message_histories[channel_id]
-                    )
+                        # Añade la respuesta de la función al historial de mensajes
+                        message_histories[channel_id].append({
+                            "role": "function",
+                            "name": function_name,
+                            "content": function_response,
+                        })
 
-                    answer = response.choices[0].message['content'].strip()
-                    answer = answer.replace("(current_timestamp):", "")
-                    answer = answer.replace("(current_timestamp)", str(current_timestamp))
+                        message = response["choices"][0]["message"]
+                        reason = response["choices"][0]["finish_reason"]
 
-                    # Eliminar el formato de entrada al comienzo de la respuesta, si está presente
-                    answer = re.sub(r'^\w+\s\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\): ', '', answer)
+                    elif function_name == "calculate":
+                        # Ahora puedes acceder al valor de "expression"
+                        expression = arguments["expression"]
 
-                    # Reemplazar los IDs de usuario en el texto con sus nombres de usuario
-                    answer = replace_user_ids_with_usernames(app.client, answer)
+                        # Llama a la función
+                        result = calculate(expression)
 
-                    say(answer)
+                        function_response = f"El resultado de la operación es {result}"
 
-                    try:
-                        if "(audio)" in body['event']['text']:
-                            tts = gtts.gTTS(answer, lang="es")
-                            mp3_file = "response.mp3"
-                            tts.save(mp3_file)
-                            response = app.client.files_upload_v2(channels=channel_id,file=mp3_file,title="Respuesta en audio")
-                    except Exception as e:
-                        say(f"Error al enviar el archivo MP3: {e}")
+                        # Llama al modelo de nuevo enviando la respuesta de la función como un nuevo mensaje
+                        response = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo-16k-0613",
+                            messages=[
+                                *message_histories[channel_id],
+                                message,
+                                {
+                                    "role": "function",
+                                    "name": function_name,
+                                    "content": function_response,
+                                }
+                            ],
+                            functions=functions,
+                            function_call="auto"
+                        )
 
-                    # Reemplazar el ID de usuario en el texto con su nombres de usuario
-                    botusername = get_username_from_id(app.client, bot_user_id)
+                        # Añade la respuesta de la función al historial de mensajes
+                        message_histories[channel_id].append({
+                            "role": "function",
+                            "name": function_name,
+                            "content": function_response,
+                        })
 
-                    # Agregar la fecha actual al mensaje del asistente
-                    answer = f"{botusername} ({current_timestamp}): {answer}"
+                        message = response["choices"][0]["message"]
+                        reason = response["choices"][0]["finish_reason"]
 
-                  except Exception as e:
-                    print(e)
-                    say("Lo siento, no puedo responder en este momento.")
+                    elif function_name == "generate_image":
+                        # Ahora puedes acceder a los valores de "n", "size" y "prompt"
+                        n = arguments["n"]
+                        size = arguments["size"]
+                        prompt = arguments["prompt"]
 
+                        # Llama a la función
+                        generate_image(
+                            channel_id,
+                            n=n,
+                            size=size,
+                            prompt=prompt
+                        )
+
+                        message_histories[channel_id].pop()
+
+                        raise ImageGenerationComplete
+                    
+                    elif function_name == "search_gif":
+                        # Ahora puedes acceder al valor de "keyword"
+                        keyword = arguments["keyword"]
+
+                        # Llama a la función
+                        gif_url = search_gif(keyword)
+
+                        if gif_url:
+                            say(f"Aquí tienes un GIF sobre {keyword}: {gif_url}")
+                        else:
+                            say(f"No pude encontrar un GIF sobre {keyword}.")
+
+                        message_histories[channel_id].pop()
+
+                        raise ImageGenerationComplete
+                    
+                answer = message['content'].strip()
+                answer = answer.replace("(current_timestamp):", "")
+                answer = answer.replace("(current_timestamp)", str(current_timestamp))
+
+                # Eliminar el formato de entrada al comienzo de la respuesta, si está presente
+                answer = re.sub(r'^\w+\s\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\): ', '', answer)
+
+                # Reemplazar los IDs de usuario en el texto con sus nombres de usuario
+                answer = replace_user_ids_with_usernames(app.client, answer)
+
+                say(answer)
+
+                try:
+                    if "(audio)" in body['event']['text']:
+                        tts = gtts.gTTS(answer, lang="es")
+                        mp3_file = "response.mp3"
+                        tts.save(mp3_file)
+                        response = app.client.files_upload_v2(channels=channel_id,file=mp3_file,title="Respuesta en audio")
+                except Exception as e:
+                    say(f"Error al enviar el archivo MP3: {e}")
+
+                # Reemplazar el ID de usuario en el texto con su nombres de usuario
+                botusername = get_username_from_id(app.client, bot_user_id)
+
+                # Agregar la fecha actual al mensaje del asistente
+                answer = f"{botusername} ({current_timestamp}): {answer}"
+
+                # Verificar si la respuesta del asistente excede el límite de tokens
+                while get_total_tokens(message_histories[channel_id]) + len(answer.split()) > 3500:
                     if len(message_histories[channel_id]) > 1:
-                        message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
-                    message_histories[channel_id].pop()  # Eliminar el último mensaje añadido
+                        message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
+                    else:
+                        break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
 
-                  # Verificar si la respuesta del asistente excede el límite de tokens
-                  while get_total_tokens(message_histories[channel_id]) + len(answer.split()) > 6000:
-                      if len(message_histories[channel_id]) > 1:
-                          message_histories[channel_id] = [message_histories[channel_id][0]] + message_histories[channel_id][2:]
-                      else:
-                          break  # Si solo hay un mensaje de "system" en el historial, interrumpir el bucle
+                message_histories[channel_id].append({"role": "assistant", "content": answer})
+            except ImageGenerationComplete:
+                pass
+            except Exception as e:
+                print(e)
+                say("Lo siento, no puedo responder en este momento.")
 
-                  message_histories[channel_id].append({"role": "assistant", "content": answer})
-          except Exception as e:
-              print(e)
-              say("Lo siento, no puedo generar una imagen en este momento.")
+                if len(message_histories[channel_id]) > 1:
+                    message_histories[channel_id].pop(1)  # Eliminar el mensaje en la posición 1
+                message_histories[channel_id].pop()  # Eliminar el último mensaje añadido            
+
+        save_all_message_histories_to_redis(message_histories)
 
 if __name__ == "__main__":
-    message_histories = {}
+    message_histories = load_all_message_histories_from_redis()
     start()
