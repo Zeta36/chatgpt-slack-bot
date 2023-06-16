@@ -1,0 +1,14 @@
+slack-bolt 
+slack-sdk 
+openai
+giphy_client
+openpyxl
+pandas
+gtts
+pdfplumber
+python-docx
+PyPDF2
+google-api-python-client
+langchain
+redis
+beautifulsoup4
